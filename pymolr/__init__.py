@@ -6,4 +6,4 @@ This initializer script of gmx2pymol
 
 """
 
-from .system import *
+from .system import System, SelectedFrame, select_coords

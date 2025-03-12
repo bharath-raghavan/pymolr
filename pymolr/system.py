@@ -3,11 +3,79 @@ import xmlrpc.client as xmlrpclib
 import pickle
 import numpy as np
 import pandas as pd
-from mimicpy import Mpt, CoordsIO
+from mimicpy import Mpt, CoordsIO, Gro, CpmdScript
+from mimicpy.utils.constants import BOHR_RADIUS
 from .trr import read_trr, get_trr_frames, write_trr, TRRReader
 from .rmsd import kabsch_rmsd, kabsch_weighted_fit
 
-def select_coords(mpt, coords, selection):
+def __select_xyz(mpt_file, xyz, selection, cpmd_file, dump):
+    d = open(dump, 'r').read()
+    
+    import re
+    start = False
+
+    mol_name_reg = re.compile(r'^\s+name="([\w_]+)"', re.MULTILINE)
+    atom_reg = re.compile(r"atom\[\s*\d+\]={type=\s*(\d+), typeB=\s*\d+, ptype=    Atom,")
+
+    from collections import defaultdict
+    atomtypes_ids = {}
+    curr_mol = ''
+
+    for i in d.splitlines():
+        if 'cmap' in i:
+            start = True
+        if start:
+            mol = mol_name_reg.findall(i)
+            if len(mol) >= 1:
+                curr_mol = mol[0]
+                atomtypes_ids[curr_mol] = []
+            idx = atom_reg.findall(i)
+            if len(idx) >= 1:
+                atomtypes_ids[curr_mol].append(int(idx[0]))
+    
+    atomtypes_ids_full = []
+    mpt = Mpt.from_file(mpt_file)
+    for mol, n_mols in mpt.molecules:
+        atomtypes_ids_full.extend(atomtypes_ids[mol]*n_mols)
+    
+    topol = mpt.select('all')
+    topol.insert(2, "type_id", atomtypes_ids_full, True)
+    
+    cpmd = CpmdScript.from_file(cpmd_file)
+    overlaps = cpmd.MIMIC.OVERLAPS.splitlines()
+    natms = int(overlaps[0])
+    for i, line in enumerate(overlaps[1:]):
+        idx = int(line.split()[1])
+        topol.at[idx, 'type_id'] = -natms+i
+        
+    topol.sort_values(by=['type_id'], inplace=True)
+    
+    with open(xyz, 'r') as f:
+        coord_txt = f.readlines()
+
+    coords = np.array([line.split()[1:4] for line in coord_txt[2:]]).astype(float)*0.1
+    
+    cols = topol.columns
+    
+    topol.insert(2, "x", coords[:,0], True)
+    topol.insert(2, "y", coords[:,1], True)
+    topol.insert(2, "z", coords[:,2], True)
+    
+    topol = topol.sort_index()
+
+    box = [0, 0, 0]
+    for i, c in enumerate(['x', 'y', 'z']):
+        box[i] = abs(max(topol[c]) - min(topol[c]))
+
+    sele = mpt.select(selection)
+    ids = sele.index - 1
+    
+    return SelectedFrame(0, 0, box, sele, topol[['x', 'y', 'z']].to_numpy()[ids], np.array([]), np.array([]), None)
+
+def select_coords(mpt, coords, selection, cpmd=None, dump=None):
+    if coords.split('.')[-1] == 'xyz' and dump != None:
+        return __select_xyz(mpt, coords, selection, cpmd, dump)
+        
     sele = Mpt.from_file(mpt).select(selection)
     ids = sele.index - 1
     coords_handle = CoordsIO(coords, 'r')
@@ -20,7 +88,6 @@ def select_coords(mpt, coords, selection):
         v = np.array([])
 
     return SelectedFrame(0, 0, box, sele, x, v, np.array([]), None)
-
 
 class System:
     def __init__(self, mpt_file, trr_files, client=None, status_file=None, status=None):
@@ -102,13 +169,16 @@ class System:
             do = lambda frame: System.__get_frame(sele, trr_file, frame)
         
         if frames == []:
+            if frame < 0: frame += self.nframes
             ret = do(frame)
-        elif self.client is None:
-            ret = [do(i) for i in frames]
-        elif as_futures:
-            ret = [self.client.submit(do, i, **kwargs) for i in frames]
         else:
-            ret = [self.client.submit(do, i, **kwargs).result() for i in frames]
+            frames = [i+self.nframes if i < 0 else i for i in frames]
+            if self.client is None:
+                ret = [do(i) for i in frames]
+            elif as_futures:
+                ret = [self.client.submit(do, i, **kwargs) for i in frames]
+            else:
+                ret = [self.client.submit(do, i, **kwargs).result() for i in frames]
         
         return ret
     
@@ -175,6 +245,7 @@ class SelectedFrame:
             self.forces = f
         self.i = 0
         self.__pbc_box = None
+        self.fitted_rmsd = []
     
     def __getitem__(self, k):
         if isinstance(k, int): k = [k]
@@ -275,10 +346,10 @@ class SelectedFrame:
             data = self.__header
             data['box'] = np.array([[self.box[0], 0, 0], [0, self.box[1], 0], [0, 0, self.box[1]]])
             data['x'] = self.positions
-            #if len(self.velocities) != 0:
-            #    data['v'] = self.velocities
-            #if len(self.forces) != 0:
-            #    data['f'] = self.forces
+            if len(self.velocities) != 0:
+                data['v'] = self.velocities
+            if len(self.forces) != 0:
+                data['f'] = self.forces
             write_trr(file, data, data['endian'], data['double'], append)
         else:
             dct = {}
@@ -306,9 +377,9 @@ class SelectedFrame:
         s = self.write(None).replace('\n','@')
         
         try:
-            pymol.do(f'g2p_load("{s}", "{name}")')
+            pymol.do(f'pymolr_load("{s}", "{name}")')
         except Fault:
-            raise Exception("The pymolrc.py file included with gmx2pymol is not sourced on the client side")
+            raise Exception("The pymolrc.py file included with pymolr is not sourced on the client side")
             
     def correct_box(self):
         if self.positions != []:
@@ -385,7 +456,8 @@ class SelectedFrame:
     def fix_pbc(self, ref, in_place=True):
         
         self.positions -= np.min(self.positions, axis=0) # make origin zero
-        box = np.max(self.positions, axis=0)
+        #box = np.max(self.positions, axis=0)
+        box = self.box
             
         sel = self.__get_images(box)
         
@@ -396,7 +468,7 @@ class SelectedFrame:
         
         if pbc_box is None:
             if ref.natoms != self.natoms:
-                raise Exception("Ref not same as self")
+                raise Exception("No. of atoms in reference and self does not match")
             
             rmsd = {}
             for i in range(8):
@@ -407,11 +479,11 @@ class SelectedFrame:
                     e.positions = pos
                     rmsd[s] = [e, rmsd_val]
                 else:
-                    raise Exception(f"{s} {e.natoms}")
-            
+                    raise Exception(f"Only {e.natoms} present in subset {s}")
             min_rmsd = min(rmsd, key=lambda x: rmsd[x][1])
             frame = rmsd[min_rmsd][0]
             frame.__pbc_box = min_rmsd
+            frame.fitted_rmsd = rmsd[min_rmsd][1]
         else:
             frame = self.__get_subset(pbc_box, sel, box)
             frame.__pbc_box = pbc_box

@@ -14,9 +14,12 @@ def basic_rmsd(V, W):
     rmsd : float
         Root-mean-square deviation between the two vectors
     """
-    diff = np.array(V) - np.array(W)
-    N = len(V)
-    return np.sqrt((diff * diff).sum() / N)
+    N = V.shape[0]
+    
+    V = V - np.average(V, axis=0)
+    W = W - np.average(W, axis=0)
+    
+    return np.sqrt(np.sum((V - W) ** 2) / N)
 
 
 def kabsch_rmsd(P, Q, W=None, translate=False):
